@@ -95,16 +95,16 @@ use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, CurrentMonitor 
 use dev_id.{ DeviceId, Identifiable }
 
 // The registers (Table 7-1).
-let REG_CONFIG   = 0x00
-let REG_SHUNT    = 0x01
-let REG_BUS      = 0x02
-let REG_POWER    = 0x03
-let REG_CURRENT  = 0x04
-let REG_CAL      = 0x05
-let REG_MASK     = 0x06
-let REG_LIMIT    = 0x07
-let REG_MANUF    = 0xFE
-let REG_DIE      = 0xFF
+let REG_CONFIG  = 0x00
+let REG_SHUNT   = 0x01
+let REG_BUS     = 0x02
+let REG_POWER   = 0x03
+let REG_CURRENT = 0x04
+let REG_CAL     = 0x05
+let REG_MASK    = 0x06
+let REG_LIMIT   = 0x07
+let REG_MANUF   = 0xFE
+let REG_DIE     = 0xFF
 
 // The manufacturer ID register's value: "TI".
 pub const MANUFACTURER_ID = 0x5449
@@ -113,7 +113,7 @@ pub const MANUFACTURER_ID = 0x5449
 pub const DIE_DID = 0x226
 
 // CONFIG: the reset bit, and bit 14 which reads 1.
-let CFG_RST  = 0x8000
+let CFG_RST   = 0x8000
 let CFG_BIT14 = 0x4000
 
 // The power-on value of CONFIG: continuous shunt and bus, 1.1 ms each, one
@@ -282,7 +282,7 @@ pub fn reg_set<P: Ina226Port>(p: P, reg: Int, v: Int, mask: Int) -> Bool [hw]
         return false
     match reg_read(p, reg)
         Some(back) => (back & mask) == (v & mask)
-        None => false
+        None       => false
 
 // ── Identity ─────────────────────────────────────────────────────────
 
@@ -347,7 +347,10 @@ pub fn conversion_time_us(code: Int) -> Int
 
 // The fields of a raw CONFIG value.
 pub fn config_of(raw: Int) -> Ina226Config
-    Ina226Config { avg: (raw >> 9) & 7, vbus_ct: (raw >> 6) & 7, vshunt_ct: (raw >> 3) & 7, mode: raw & 7 }
+    Ina226Config { avg: (raw >> 9) & 7,
+        vbus_ct: (raw >> 6) & 7,
+        vshunt_ct: (raw >> 3) & 7,
+        mode: raw & 7 }
 
 // The CONFIG value for the fields, with bit 14 set as the part reads it.
 pub fn config_bits(c: Ina226Config) -> Int
@@ -491,7 +494,9 @@ pub fn power_uw_of(raw: Int, cal: Int, shunt_micro_ohm: Int) -> Int
 
 // The flags of a MASK/ENABLE value.
 pub fn flags_of(raw: Int) -> Ina226Flags
-    Ina226Flags { alert: (raw & ME_AFF) != 0, ready: (raw & ME_CVRF) != 0, overflow: (raw & ME_OVF) != 0 }
+    Ina226Flags { alert: (raw & ME_AFF) != 0,
+        ready: (raw & ME_CVRF) != 0,
+        overflow: (raw & ME_OVF) != 0 }
 
 // ── Readings ─────────────────────────────────────────────────────────
 
@@ -530,7 +535,7 @@ pub fn reading_with_flags<P: Ina226Port>(p: P, shunt_micro_ohm: Int) -> ?Ina226R
 pub fn reading_of<P: Ina226Port>(p: P, shunt_micro_ohm: Int) -> ?MonReading [hw]
     match reading_with_flags(p, shunt_micro_ohm)
         Some(x) => Some(x.reading)
-        None => None
+        None    => None
 
 // Starts a conversion of the shunt and the bus voltage and answers the time
 // it takes in microseconds, to be waited before the result is read.  A
@@ -542,7 +547,10 @@ pub fn convert_start<P: Ina226Port>(p: P) -> Int [hw]
     let Some(c) = config_read(p) else return -1
     if mode_is_continuous(c.mode)
         return 0
-    let t = Ina226Config { avg: c.avg, vbus_ct: c.vbus_ct, vshunt_ct: c.vshunt_ct, mode: MODE_BOTH_TRIGGERED }
+    let t = Ina226Config { avg: c.avg,
+        vbus_ct: c.vbus_ct,
+        vshunt_ct: c.vshunt_ct,
+        mode: MODE_BOTH_TRIGGERED }
     if not config_write(p, t)
         return -1
     result_us(t)
@@ -552,7 +560,7 @@ pub fn convert_start<P: Ina226Port>(p: P) -> Int [hw]
 pub fn conversion_ready<P: Ina226Port>(p: P) -> Bool [hw]
     match reg_read(p, REG_MASK)
         Some(m) => (m & ME_CVRF) != 0
-        None => false
+        None    => false
 
 // ── The alert ────────────────────────────────────────────────────────
 
@@ -703,8 +711,8 @@ impl Ina226
         mode_write(self.port, mode)
 
     // Sets the alert; see `alert_write`.
-    fn set_alert(self, func: Int, conversion_ready: Bool, active_high: Bool,
-                 latch: Bool, limit_raw: Int) -> Bool [hw]
+    fn set_alert(self, func: Int, conversion_ready: Bool, active_high: Bool, latch: Bool,
+                 limit_raw: Int) -> Bool [hw]
         alert_write(self.port, func, conversion_ready, active_high, latch, limit_raw)
 
     // The level of the ALERT pin, -1 for a wiring with none.

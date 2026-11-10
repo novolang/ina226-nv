@@ -15,6 +15,21 @@ driver's functions run over a double of the part that follows the data
 sheet's register map, its Equations 3 and 4 and its bus protocol.  A
 reading from a part on a board has not been taken.
 
+## Install
+
+```sh
+novo pkg add ina226-nv
+```
+
+The device program is `examples/power_read.nv`.  Make it the `main` of a package that
+depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+novo build --target=frdm-mcxn947 src/main.nv
+```
+
 ## The device program
 
 `examples/power_read.nv` reads a breakout over I2C once a second and prints
@@ -91,9 +106,8 @@ whether or not the program uses it.
 
 The two Nordic board packages answer for I2C as absent hardware, so the
 build removes the code that follows the first bus read, and their rows are
-the image without the driver's reading path.  The feature
-`features/embedded-devex/nordic-twim-i2c-driver.md` in the novo-lang
-repository tracks the missing Nordic I2C driver.  The FRDM-MCXN947 board
+the image without the driver's reading path.  The novo-lang
+repository tracks the missing Nordic I2C driver as a feature.  The FRDM-MCXN947 board
 package drives I2C, and its row is the image with the driver's code in it.
 On the Nordic boards the program prints `ina226: no answer`.
 
@@ -283,9 +297,7 @@ suite are computed from the register steps.
 
 The sources read for this driver, for their fixes and not ported, are the
 data sheet above and Zephyr's `drivers/sensor/ti/ina2xx`.  Embassy and
-esp-hal hold no INA226 driver
-(`planning/PERIPHERAL-DRIVER-CANDIDATES.md`, section 3, in the novo-lang
-repository).  Each fix kept is named in `src/ina226.nv` where it is kept:
+esp-hal hold no INA226 driver.  Each fix kept is named in `src/ina226.nv` where it is kept:
 
 - Zephyr computes the calibration from the devicetree and does not check
   that it fits 15 bits or is not 0.  This driver raises the step until it

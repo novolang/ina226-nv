@@ -71,6 +71,6 @@ fn main() [hw]
                 field(" uA=", r.current.ua)
                 field(" uW=", r.power.uw)
                 hal.uart.write("\n")
-            None =>
+            None    =>
                 hal.uart.write("ina226: no result\n")
         hal.timer.delay_ms(1000)

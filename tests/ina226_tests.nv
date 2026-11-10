@@ -76,7 +76,7 @@ fn signed(v: Int) -> Int
 // The Current register: the shunt register times the calibration over 2048
 // (Equation 3), truncated toward zero.
 fn current_reg(c: Chip) -> Int
-    (signed(at(c.regs, 0x01)) * at(c.regs, 0x05)) / 2048
+    signed(at(c.regs, 0x01)) * at(c.regs, 0x05) / 2048
 
 // The power-on reset: CONFIG, CAL, MASK/ENABLE and the limit return to
 // their power-on values unless the double was told to ignore the reset.
@@ -98,7 +98,7 @@ fn chip_reg(c: Chip, reg: Int) -> Int
         var cur = current_reg(c)
         if cur < 0
             cur = 0 - cur
-        return ((cur * (at(c.regs, 0x02) & 0x7FFF)) / 20000) & 0xFFFF
+        return (cur * (at(c.regs, 0x02) & 0x7FFF) / 20000) & 0xFFFF
     if reg == 0x06
         let v = at(c.regs, 0x06) | at(c.st, 50)
         c.st.insert(50, at(c.st, 50) & 0xFFE7)
@@ -144,7 +144,7 @@ impl I2cBus for FakeI2c
             return false
         if left > 0
             self.c.st.insert(42, left - 1)
-        chip_write(self.c, data[0] as Int, ((data[1] as Int) << 8) | (data[2] as Int))
+        chip_write(self.c, data[0] as Int, (data[1] as Int << 8) | data[2] as Int)
         true
 
     fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
@@ -228,21 +228,21 @@ fn log_is(c: Chip, want: [Int])
 fn int_or(o: ?Int) -> Int
     match o
         Some(v) => v
-        None => -999999
+        None    => -999999
 fn config_or(o: ?Ina226Config) -> Ina226Config
     match o
         Some(c) => c
-        None => Ina226Config { avg: -1, vbus_ct: -1, vshunt_ct: -1, mode: -1 }
+        None    => Ina226Config { avg: -1, vbus_ct: -1, vshunt_ct: -1, mode: -1 }
 
 fn mv_or(o: ?MilliVolts) -> Int
     match o
         Some(v) => v.mv
-        None => -999999
+        None    => -999999
 
 fn reading_or(o: ?Ina226Reading) -> Ina226Reading
     match o
         Some(r) => r
-        None => Ina226Reading { reading: MonReading { bus: MilliVolts { mv: -1 }, shunt: MicroVolts { uv: -1 },
+        None    => Ina226Reading { reading: MonReading { bus: MilliVolts { mv: -1 }, shunt: MicroVolts { uv: -1 },
                                                       current: MicroAmps { ua: -1 }, power: MicroWatts { uw: -1 },
                                                       overflow: false },
                                 flags: Ina226Flags { alert: false, ready: false, overflow: false } }
@@ -250,7 +250,7 @@ fn reading_or(o: ?Ina226Reading) -> Ina226Reading
 fn flags_or(o: ?Ina226Flags) -> Ina226Flags
     match o
         Some(f) => f
-        None => Ina226Flags { alert: false, ready: false, overflow: false }
+        None    => Ina226Flags { alert: false, ready: false, overflow: false }
 
 // The data sheet's example: a 2 mohm shunt carrying 10 A at 11.98 V, with
 // the calibration for a 1 mA step programmed.
@@ -582,12 +582,12 @@ fn test_the_identity_is_the_manufacturer_and_the_die() [io, hw]
         Some(i) =>
             test.assert_eq(i.who, 0x226)
             test.assert(i.rev == Some(0))
-        None => test.assert(false)
+        None    => test.assert(false)
     // Revision 1 is the other die COO.
     c.regs.insert(0xFF, 0x2261)
     match ina226.id_read(d)
         Some(i) => test.assert(i.rev == Some(1))
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_the_identity_matches_only_the_ina226() [io, hw]
@@ -623,7 +623,27 @@ fn test_the_bring_up_checks_the_identity_resets_and_checks_config() [io, hw]
     test.assert_eq(at(c.regs, 0x00), 0x4127)
     test.assert_eq(at(c.regs, 0x05), 0)
     test.assert_eq(at(c.st, 22), 400000)
-    log_is(c, [2, 0x40, 0xFE, 2, -1, 2, 0x40, 0xFF, 2, -1, 1, 0x40, 0x00, 0xC1, 0x27, -1, 2, 0x40, 0x00, 2, -1])
+    log_is(c, [2,
+        0x40,
+        0xFE,
+        2,
+        -1,
+        2,
+        0x40,
+        0xFF,
+        2,
+        -1,
+        1,
+        0x40,
+        0x00,
+        0xC1,
+        0x27,
+        -1,
+        2,
+        0x40,
+        0x00,
+        2,
+        -1])
 
 @test
 fn test_the_bring_up_stops_at_each_refusal() [io, hw]
@@ -780,7 +800,7 @@ fn test_a_charging_battery_reads_a_negative_current_and_power_zero_or_up() [io, 
             test.assert_eq(r.current.ua, -10000000)
             // The Power register is unsigned, so it reads the magnitude.
             test.assert(r.power.uw > 0)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_the_overflow_flag_gives_a_reading_with_no_current_or_power() [io, hw]
@@ -924,7 +944,28 @@ fn test_the_limit_is_written_before_the_function_is_enabled() [io, hw]
     let c = chip()
     let d = dut(c)
     test.assert(ina226.alert_write(d, 1, false, false, false, 8000))
-    log_is(c, [1, 0x40, 0x07, 0x1F, 0x40, -1, 2, 0x40, 0x07, 2, -1, 1, 0x40, 0x06, 0x80, 0x00, -1, 2, 0x40, 0x06, 2, -1])
+    log_is(c, [1,
+        0x40,
+        0x07,
+        0x1F,
+        0x40,
+        -1,
+        2,
+        0x40,
+        0x07,
+        2,
+        -1,
+        1,
+        0x40,
+        0x06,
+        0x80,
+        0x00,
+        -1,
+        2,
+        0x40,
+        0x06,
+        2,
+        -1])
 
 @test
 fn test_a_function_outside_the_range_is_refused_and_sends_nothing() [io, hw]
