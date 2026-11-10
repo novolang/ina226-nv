@@ -112,9 +112,12 @@ pub const MANUFACTURER_ID = 0x5449
 // The die ID register's DID field, bits 15 to 4.
 pub const DIE_DID = 0x226
 
-// CONFIG: the reset bit, bit 14 which reads 1, and the power-on value.
+// CONFIG: the reset bit, and bit 14 which reads 1.
 let CFG_RST  = 0x8000
 let CFG_BIT14 = 0x4000
+
+// The power-on value of CONFIG: continuous shunt and bus, 1.1 ms each, one
+// average.
 pub const CONFIG_POR = 0x4127
 
 // MASK/ENABLE bits.
