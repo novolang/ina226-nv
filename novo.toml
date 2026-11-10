@@ -31,7 +31,5 @@ tier = "embedded"
 # dependency here would make devices-nv's own range a second package.
 embedded-hal-nv = "^0.3.2"
 # The wiring record a board's device table hands `attach`, the register
-# helpers, and the CurrentMonitor trait, which is in devices-nv 0.3.3.  The
-# registry's newest devices-nv is 0.3.2, so this is a path dependency
-# until 0.3.3 is published (PATH-DEPENDENCIES.md).
-devices-nv      = { path = "../devices-nv" }
+# helpers, and the CurrentMonitor trait.
+devices-nv      = "^0.3.3"

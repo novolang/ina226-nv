@@ -50,5 +50,5 @@ and power monitor on an I2C bus.
   board packages answer for I2C as absent hardware: on those images
   `begin` answers `false` until the boards drive the buses.  The gap is
   tracked by `features/embedded-devex/nordic-twim-i2c-driver.md`.
-- `devices-nv` is a path dependency (`../devices-nv`, 0.3.3) until 0.3.3 is
-  published, because `CurrentMonitor` is not in 0.3.2.
+- `devices-nv` is the registry range `^0.3.3`, the first release with
+  `CurrentMonitor`.
