@@ -46,9 +46,10 @@ and power monitor on an I2C bus.
 - `mon_set_shunt` accepts only the resistance the board was attached with.
 - The SMBus alert response, a second channel and an async form are not
   implemented.
-- The device program builds for the nRF52840 DK and the nRF54LM20 DK, whose
-  board packages answer for I2C as absent hardware: on those images
-  `begin` answers `false` until the boards drive the buses.  The gap is
-  tracked by `features/embedded-devex/nordic-twim-i2c-driver.md`.
+- The device program builds for the nRF52840 DK and the nRF54LM20 DK, which
+  drive I2C with TWIM0 and TWIM22, so their images carry the reading path:
+  21,624 and 22,584 bytes of flash, where before the Nordic buses landed
+  they were 14,076 and 14,840 bytes.  A reply from the part over either bus
+  is NOT VERIFIED.
 - `devices-nv` is the registry range `^0.3.3`, the first release with
   `CurrentMonitor`.
