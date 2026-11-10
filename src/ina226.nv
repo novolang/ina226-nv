@@ -1,0 +1,747 @@
+// ina226 — Texas Instruments' INA226 current, voltage and power monitor,
+// on its I2C bus, as devices-nv's `CurrentMonitor` and `Identifiable`.
+//
+// The facts below are from the data sheet "INA226 36V, 16-Bit,
+// Ultra-Precise I2C Output Current, Voltage, and Power Monitor With
+// Alert", Texas Instruments, SBOS547C, June 2011, revised August 2026; the
+// sections, tables and equations named are that sheet's.  Where the sheet
+// and the drivers read for this one disagree, the site says which was
+// taken.
+//
+// A shunt resistor of a fraction of an ohm sits in series with the load.
+// The part measures the small voltage across it, the shunt voltage, and the
+// voltage at its VBUS pin, the bus voltage.  It does not know the
+// resistance.  A program tells it by writing the Calibration register, from
+// which the part computes the Current register and the Power register
+// (Equations 3 and 4); until then both read 0 (Section 6.5).
+//
+// The registers (Table 7-1), all 16 bits, the high byte first:
+//
+//   0x00  CONFIG        RST (15), AVG (11:9), VBUSCT (8:6), VSHCT (5:3),
+//                       MODE (2:0); bit 14 reads 1 and stays 1; POR 0x4127
+//   0x01  SHUNT         signed, 2.5 uV per step, full scale 81.92 mV
+//   0x02  BUS           1.25 mV per step, bit 15 always 0, full scale 40.96 V
+//   0x03  POWER         25 times the current step per step, unsigned
+//   0x04  CURRENT       signed, one current step per step
+//   0x05  CALIBRATION   bits 14:0; bit 15 is not used
+//   0x06  MASK/ENABLE   SOL (15), SUL (14), BOL (13), BUL (12), POL (11),
+//                       CNVR (10), AFF (4), CVRF (3), OVF (2), APOL (1),
+//                       LEN (0)
+//   0x07  ALERT LIMIT   compared with the register the alert function names
+//   0xFE  MANUFACTURER  0x5449
+//   0xFF  DIE ID        DID (15:4) 0x226, RID (3:0); 0x2260 or 0x2261
+//
+// The calibration (Equation 1, Equation 2):
+//
+//   Current_LSB = maximum expected current / 2^15
+//   CAL         = 0.00512 / (Current_LSB * R_SHUNT)
+//
+// With the current step in microamps and the resistance in micro-ohms,
+// CAL = 5 120 000 000 / (Current_LSB * R_SHUNT).  The data sheet's worked
+// example (Section 6.5.1): 15 A at most, Current_LSB rounded up from
+// 457.7 uA to 1 mA, R_SHUNT 2 mohm, gives CAL = 2560 (0xA00); a shunt
+// voltage of 8000 steps (20 mV) gives a current of 8000 * 2560 / 2048 =
+// 10000 steps, 10 A; a bus voltage of 9584 steps (11.98 V) gives a power of
+// 10000 * 9584 / 20000 = 4792 steps of 25 mW, 119.82 W.
+//
+// Fix kept: the part's real current step is 0.00512 / (CAL * R_SHUNT), not
+// the Current_LSB the program chose, because CAL is an integer.  The driver
+// converts the Current register with the real step,
+// 5 120 000 000 / (CAL * R_SHUNT) microamps, so a truncated CAL does not
+// leave a gain error of up to 1 / CAL.  CAL is truncated, which keeps the
+// real step at or above the one asked for and so the full scale at or above
+// the largest current; Zephyr's `drivers/sensor/ti/ina2xx` rounds it to the
+// closest.
+//
+// Fix kept: CAL is 15 bits.  A shunt and a current step whose CAL is above
+// 32767 or is 0 cannot be programmed; the driver raises the current step
+// until CAL fits, and refuses a shunt for which no step does.  Zephyr's
+// computes CAL from the devicetree and never checks it.
+//
+// Fix kept: a shunt voltage past 81.92 mV saturates the shunt register.
+// `mon_set_shunt` refuses a largest current that would drop more than
+// 81.92 mV across the shunt, as the trait asks.
+//
+// The registers are read one at a time.  The sheet defines a read as the
+// pointer write and two bytes (Section 6.5.5.3: "Read data is from the last
+// register pointer location"), and says nothing of a pointer that advances
+// across registers; devices-nv's reference double lets a read run on into
+// the next register, which the sheet does not promise.  A reading is six
+// transactions: SHUNT, BUS, CURRENT, POWER, CALIBRATION and MASK/ENABLE.
+//
+// Fix kept: reading MASK/ENABLE clears the Conversion Ready flag (CVRF) and
+// a latched Alert Function Flag (AFF) (Section 7.1.7).  A reading reads it
+// last, for the math overflow flag (OVF), and so it clears them.  A program
+// that latches alerts uses `reading_with_flags`, which returns the flags it
+// read with the reading.
+//
+// Conversion time (Table 7-3, 7-4, 7-5): one conversion of the shunt takes
+// VSHCT, one of the bus voltage VBUSCT, and with both on and AVG averages
+// the result is ready after AVG * (VBUSCT + VSHCT).  A write to CONFIG
+// halts a conversion in progress and starts a new one from the new
+// settings (Section 7.1.1).
+//
+// The address (Table 6-2) is 0x40 + 4 * A1 + A0 with each pin 0 for GND, 1
+// for VS, 2 for SDA and 3 for SCL.
+//
+// A bus enters through `Ina226Port`, which a type that holds a bus
+// implements: `Ina226I2c`.  The framing is `i2c_read_into` and `i2c_write`,
+// generic over `I2cBus`, so a test runs them over a double of the bus.
+
+use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_power.{ MilliVolts }
+use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, CurrentMonitor }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers (Table 7-1).
+let REG_CONFIG   = 0x00
+let REG_SHUNT    = 0x01
+let REG_BUS      = 0x02
+let REG_POWER    = 0x03
+let REG_CURRENT  = 0x04
+let REG_CAL      = 0x05
+let REG_MASK     = 0x06
+let REG_LIMIT    = 0x07
+let REG_MANUF    = 0xFE
+let REG_DIE      = 0xFF
+
+// The manufacturer ID register's value: "TI".
+pub const MANUFACTURER_ID = 0x5449
+
+// The die ID register's DID field, bits 15 to 4.
+pub const DIE_DID = 0x226
+
+// CONFIG: the reset bit, bit 14 which reads 1, and the power-on value.
+let CFG_RST  = 0x8000
+let CFG_BIT14 = 0x4000
+pub const CONFIG_POR = 0x4127
+
+// MASK/ENABLE bits.
+let ME_CNVR = 0x0400
+let ME_AFF  = 0x0010
+let ME_CVRF = 0x0008
+let ME_OVF  = 0x0004
+let ME_APOL = 0x0002
+let ME_LEN  = 0x0001
+
+// The 15 bits of the Calibration register, and the numerator of Equation 1
+// in micro-ohm microamps.
+let CAL_MAX = 0x7FFF
+let CAL_NUM = 5120000000
+
+// The largest shunt voltage the part measures, in microvolts.
+pub const SHUNT_FULL_SCALE_UV = 81920
+
+// The clock `setup` asks for: I2C fast mode.
+let I2C_HZ = 400000
+
+// The operating modes of CONFIG.MODE (Table 7-6).  Triggered modes convert
+// once when CONFIG is written; continuous modes convert until told not to.
+pub const MODE_POWER_DOWN = 0
+
+// Triggered, the shunt voltage only.
+pub const MODE_SHUNT_TRIGGERED = 1
+
+// Triggered, the bus voltage only.
+pub const MODE_BUS_TRIGGERED = 2
+
+// Triggered, the shunt and the bus voltage.
+pub const MODE_BOTH_TRIGGERED = 3
+
+// Continuous, the shunt voltage only.
+pub const MODE_SHUNT_CONTINUOUS = 5
+
+// Continuous, the bus voltage only.
+pub const MODE_BUS_CONTINUOUS = 6
+
+// Continuous, the shunt and the bus voltage; the power-on mode.
+pub const MODE_BOTH_CONTINUOUS = 7
+
+// The alert functions of MASK/ENABLE, one at a time: none.
+pub const ALERT_NONE = 0
+
+// The alert fires when the shunt voltage exceeds the limit (SOL).
+pub const ALERT_SHUNT_OVER = 1
+
+// The alert fires when the shunt voltage drops below the limit (SUL).
+pub const ALERT_SHUNT_UNDER = 2
+
+// The alert fires when the bus voltage exceeds the limit (BOL).
+pub const ALERT_BUS_OVER = 3
+
+// The alert fires when the bus voltage drops below the limit (BUL).
+pub const ALERT_BUS_UNDER = 4
+
+// The alert fires when the power exceeds the limit (POL).
+pub const ALERT_POWER_OVER = 5
+
+// The CONFIG fields as codes: `avg` 0 to 7 for 1, 4, 16, 64, 128, 256,
+// 512 and 1024 averages; `vbus_ct` and `vshunt_ct` 0 to 7 for 140, 204,
+// 332, 588, 1100, 2116, 4156 and 8244 microseconds; `mode` 0 to 7 as above.
+pub @value
+struct Ina226Config
+    avg: Int
+    vbus_ct: Int
+    vshunt_ct: Int
+    mode: Int
+
+// A calibration: the value of the Calibration register and the current
+// step in microamps it was computed for.
+pub @value
+struct Ina226Cal
+    cal: Int
+    current_lsb_ua: Int
+
+// The flags of MASK/ENABLE as they were when it was read.
+pub @value
+struct Ina226Flags
+    alert: Bool
+    ready: Bool
+    overflow: Bool
+
+// A reading with the flags read with it.
+pub @value
+struct Ina226Reading
+    reading: MonReading
+    flags: Ina226Flags
+
+// A bus the part is on.  `setup` makes the bus ready and the ALERT pin an
+// input and answers whether the wiring suits it; `read_regs` reads `n`
+// bytes from the register `reg` in one transaction; `write_regs` writes
+// the bytes of `src` from `reg` in one transaction; `alert_level` answers
+// the level of the ALERT pin, -1 for a wiring with none.
+pub trait Ina226Port
+    fn setup(self) -> Bool [hw]
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+    fn alert_level(self) -> Int [hw]
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// Reads `n` bytes from the register `reg` into `dst` in one I2C
+// transaction, a write of the pointer and a repeated start: whether the
+// part answered.
+pub fn i2c_read_into<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, n: Int,
+                                var dst: DevBytes) -> Bool [hw]
+    dev_bus.wiring_read_into(bus, w, reg, n, var dst)
+
+// Writes the bytes of `src` to the register `reg` in one I2C transaction:
+// whether the part acknowledged.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, reg: Int, src: DevBytes) -> Bool [hw]
+    dev_bus.wiring_write_from(bus, w, reg, src)
+
+// Makes the I2C bus ready: the ALERT pin an input, the bus at 400 kHz.
+// Answers whether the wiring has an address.  The ALERT pin is open-drain
+// and needs a pull-up on the board.
+pub fn i2c_setup<B: I2cBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    if let Some(alert) = w.irq
+        gpio.mode(alert, 0)
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// The level of the part's ALERT pin on the board, 1 or 0, or -1 for a
+// wiring with no alert pin.  The pin is active low unless the polarity bit
+// was set.
+pub fn alert_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(alert) = w.irq else return -1
+    gpio.get(alert)
+
+// The I2C address for the pins A1 and A0, each 0 for GND, 1 for VS, 2 for
+// SDA and 3 for SCL (Table 6-2): 0x40 to 0x4F, or -1 for a pin outside 0
+// to 3.
+pub fn address_of(a1: Int, a0: Int) -> Int
+    if a1 < 0 or a1 > 3 or a0 < 0 or a0 > 3
+        return -1
+    0x40 + 4 * a1 + a0
+
+// ── Register access ──────────────────────────────────────────────────
+
+// The 16-bit register `reg`, or `None` when the part did not answer.
+pub fn reg_read<P: Ina226Port>(p: P, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(reg, 2, var b)
+        return None
+    Some((b[0] as Int << 8) | b[1] as Int)
+
+// Writes `v` to the 16-bit register `reg`: whether the part acknowledged.
+pub fn reg_write<P: Ina226Port>(p: P, reg: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(((v >> 8) & 0xFF) as u8)
+    let _ = src.push((v & 0xFF) as u8)
+    p.write_regs(reg, src)
+
+// Writes `v` to the register `reg` and reads it back: whether the part
+// holds the bits of `mask`.  The bits outside the mask are status bits or
+// are not stored.
+pub fn reg_set<P: Ina226Port>(p: P, reg: Int, v: Int, mask: Int) -> Bool [hw]
+    if not reg_write(p, reg, v)
+        return false
+    match reg_read(p, reg)
+        Some(back) => (back & mask) == (v & mask)
+        None => false
+
+// ── Identity ─────────────────────────────────────────────────────────
+
+// The manufacturer ID, which reads 0x5449, or `None` when the part did not
+// answer.
+pub fn manufacturer_read<P: Ina226Port>(p: P) -> ?Int [hw]
+    reg_read(p, REG_MANUF)
+
+// The die ID register: the device ID in bits 15 to 4 and the revision in
+// bits 3 to 0, or `None` when the part did not answer.
+pub fn die_read<P: Ina226Port>(p: P) -> ?Int [hw]
+    reg_read(p, REG_DIE)
+
+// Whether a manufacturer ID and a die ID are an INA226's: 0x5449 and a DID
+// of 0x226, whatever the revision.
+pub fn id_matches(manufacturer: Int, die: Int) -> Bool
+    manufacturer == MANUFACTURER_ID and (die >> 4) == DIE_DID
+
+// The part's identity as a `DeviceId`: the DID as `who` and the revision as
+// `rev`; `None` when the part did not answer or is not an INA226.
+pub fn id_read<P: Ina226Port>(p: P) -> ?DeviceId [hw]
+    let Some(m) = manufacturer_read(p) else return None
+    let Some(d) = die_read(p) else return None
+    if not id_matches(m, d)
+        return None
+    Some(DeviceId { who: d >> 4, rev: Some(d & 0xF) })
+
+// ── The configuration ────────────────────────────────────────────────
+
+// The number of averages a CONFIG.AVG code means: 1, 4, 16, 64, 128, 256,
+// 512 and 1024 (Table 7-3); 0 for a code outside 0 to 7.
+pub fn averages_of(code: Int) -> Int
+    if code < 0 or code > 7
+        return 0
+    if code == 0
+        return 1
+    if code < 4
+        return 1 << (2 * code)
+    1 << (code + 3)
+
+// The conversion time a VBUSCT or VSHCT code means, in microseconds: 140,
+// 204, 332, 588, 1100, 2116, 4156 and 8244 (Tables 7-4 and 7-5); -1 for a
+// code outside 0 to 7.
+pub fn conversion_time_us(code: Int) -> Int
+    if code == 0
+        return 140
+    if code == 1
+        return 204
+    if code == 2
+        return 332
+    if code == 3
+        return 588
+    if code == 4
+        return 1100
+    if code == 5
+        return 2116
+    if code == 6
+        return 4156
+    if code == 7
+        return 8244
+    -1
+
+// The fields of a raw CONFIG value.
+pub fn config_of(raw: Int) -> Ina226Config
+    Ina226Config { avg: (raw >> 9) & 7, vbus_ct: (raw >> 6) & 7, vshunt_ct: (raw >> 3) & 7, mode: raw & 7 }
+
+// The CONFIG value for the fields, with bit 14 set as the part reads it.
+pub fn config_bits(c: Ina226Config) -> Int
+    CFG_BIT14 | ((c.avg & 7) << 9) | ((c.vbus_ct & 7) << 6) | ((c.vshunt_ct & 7) << 3) | (c.mode & 7)
+
+// Whether a mode converts by itself: 5, 6 and 7.
+pub fn mode_is_continuous(mode: Int) -> Bool
+    mode >= 5 and mode <= 7
+
+// The time one result takes under the configuration, in microseconds: the
+// averages times the conversion times of the signals the mode measures; 0
+// in power-down.  A field outside its range gives -1.
+pub fn result_us(c: Ina226Config) -> Int
+    let n = averages_of(c.avg)
+    let tb = conversion_time_us(c.vbus_ct)
+    let ts = conversion_time_us(c.vshunt_ct)
+    if n == 0 or tb < 0 or ts < 0 or c.mode < 0 or c.mode > 7
+        return -1
+    let m = c.mode & 3
+    if m == 0
+        return 0
+    if m == 1
+        return n * ts
+    if m == 2
+        return n * tb
+    n * (tb + ts)
+
+// The CONFIG register as fields, or `None` when the part did not answer.
+pub fn config_read<P: Ina226Port>(p: P) -> ?Ina226Config [hw]
+    let Some(raw) = reg_read(p, REG_CONFIG) else return None
+    Some(config_of(raw))
+
+// Writes the fields to CONFIG and reads them back: whether the part holds
+// them.  A field outside its range is refused.  The write halts a
+// conversion in progress and starts one from the new settings.
+pub fn config_write<P: Ina226Port>(p: P, c: Ina226Config) -> Bool [hw]
+    if c.avg < 0 or c.avg > 7 or c.vbus_ct < 0 or c.vbus_ct > 7 or c.vshunt_ct < 0 or c.vshunt_ct > 7 or c.mode < 0 or c.mode > 7
+        return false
+    reg_set(p, REG_CONFIG, config_bits(c), 0x7FFF)
+
+// Sets the averaging code, 0 to 7, and keeps the other fields.
+pub fn averaging_write<P: Ina226Port>(p: P, code: Int) -> Bool [hw]
+    let Some(c) = config_read(p) else return false
+    config_write(p, Ina226Config { avg: code, vbus_ct: c.vbus_ct, vshunt_ct: c.vshunt_ct, mode: c.mode })
+
+// Sets the conversion time codes of the bus and shunt voltages, 0 to 7
+// each, and keeps the other fields.
+pub fn conversion_times_write<P: Ina226Port>(p: P, vbus_ct: Int, vshunt_ct: Int) -> Bool [hw]
+    let Some(c) = config_read(p) else return false
+    config_write(p, Ina226Config { avg: c.avg, vbus_ct: vbus_ct, vshunt_ct: vshunt_ct, mode: c.mode })
+
+// Sets the operating mode, 0 to 7, and keeps the other fields.
+pub fn mode_write<P: Ina226Port>(p: P, mode: Int) -> Bool [hw]
+    let Some(c) = config_read(p) else return false
+    config_write(p, Ina226Config { avg: c.avg, vbus_ct: c.vbus_ct, vshunt_ct: c.vshunt_ct, mode: mode })
+
+// Resets the part: every register returns to its power-on value.  The
+// reset bit clears itself.  Whether the part acknowledged.
+pub fn reset<P: Ina226Port>(p: P) -> Bool [hw]
+    reg_write(p, REG_CONFIG, CFG_RST | CONFIG_POR)
+
+// ── The calibration ──────────────────────────────────────────────────
+
+// The Calibration register value of Equation 1 for a shunt of
+// `shunt_micro_ohm` micro-ohms and a current step of `current_lsb_ua`
+// microamps, truncated: 5 120 000 000 / (step * resistance).  0 for a
+// value that is not positive.
+pub fn cal_for(shunt_micro_ohm: Int, current_lsb_ua: Int) -> Int
+    if shunt_micro_ohm <= 0 or current_lsb_ua <= 0
+        return 0
+    CAL_NUM / (current_lsb_ua * shunt_micro_ohm)
+
+// The smallest current step in microamps, at least 1 for a positive
+// current, that covers
+// `max_ua` over 15 bits (Equation 2) and gives a Calibration value of at
+// most 32767, for a shunt of `shunt_micro_ohm` micro-ohms.  0 when the
+// arguments are not positive.
+pub fn current_lsb_for(shunt_micro_ohm: Int, max_ua: Int) -> Int
+    if shunt_micro_ohm <= 0 or max_ua <= 0
+        return 0
+    var lsb = (max_ua + 32767) / 32768
+    let fit = (CAL_NUM + CAL_MAX * shunt_micro_ohm - 1) / (CAL_MAX * shunt_micro_ohm)
+    if lsb < fit
+        lsb = fit
+    lsb
+
+// The calibration for a shunt and the largest current the program expects:
+// `cal` and the current step it was computed for, or a `cal` of 0 when the
+// shunt does not fit the part: no positive step gives a Calibration of 1 or
+// more, or the largest current drops more than the shunt voltage the part
+// measures.
+pub fn calibration(shunt_micro_ohm: Int, max_ua: Int) -> Ina226Cal
+    let none = Ina226Cal { cal: 0, current_lsb_ua: 0 }
+    if not dev_current.mon_shunt_fits(shunt_micro_ohm, max_ua, SHUNT_FULL_SCALE_UV)
+        return none
+    let lsb = current_lsb_for(shunt_micro_ohm, max_ua)
+    let cal = cal_for(shunt_micro_ohm, lsb)
+    if cal < 1 or cal > CAL_MAX
+        return none
+    Ina226Cal { cal: cal, current_lsb_ua: lsb }
+
+// Programs the calibration for a shunt and a largest current and reads it
+// back: whether the part holds it.  A shunt that does not fit is refused.
+pub fn cal_write<P: Ina226Port>(p: P, shunt_micro_ohm: Int, max_ua: Int) -> Bool [hw]
+    let c = calibration(shunt_micro_ohm, max_ua)
+    if c.cal == 0
+        return false
+    reg_set(p, REG_CAL, c.cal, 0x7FFF)
+
+// The Calibration register, or `None` when the part did not answer.  0
+// means no shunt was ever set.
+pub fn cal_read<P: Ina226Port>(p: P) -> ?Int [hw]
+    reg_read(p, REG_CAL)
+
+// ── Conversions of the registers ─────────────────────────────────────
+
+// The shunt voltage a register means, in microvolts: 2.5 uV per step,
+// rounded toward zero.
+pub fn shunt_uv_of(raw: Int) -> Int
+    dev_bus.dev_sign_extend(raw, 16) * 5 / 2
+
+// The bus voltage a register means, in millivolts: 1.25 mV per step,
+// rounded toward zero.  Bit 15 is always 0 and is ignored.
+pub fn bus_mv_of(raw: Int) -> Int
+    (raw & 0x7FFF) * 5 / 4
+
+// The current a register means, in microamps: the step is
+// 5 120 000 000 / (CAL * R_SHUNT) microamps.  0 for a calibration or a
+// resistance that is not positive.
+pub fn current_ua_of(raw: Int, cal: Int, shunt_micro_ohm: Int) -> Int
+    if cal <= 0 or shunt_micro_ohm <= 0
+        return 0
+    dev_bus.dev_sign_extend(raw, 16) * CAL_NUM / (cal * shunt_micro_ohm)
+
+// The power a register means, in microwatts: 25 steps of the current per
+// step.  0 for a calibration or a resistance that is not positive.
+pub fn power_uw_of(raw: Int, cal: Int, shunt_micro_ohm: Int) -> Int
+    if cal <= 0 or shunt_micro_ohm <= 0
+        return 0
+    (raw & 0xFFFF) * (25 * CAL_NUM) / (cal * shunt_micro_ohm)
+
+// The flags of a MASK/ENABLE value.
+pub fn flags_of(raw: Int) -> Ina226Flags
+    Ina226Flags { alert: (raw & ME_AFF) != 0, ready: (raw & ME_CVRF) != 0, overflow: (raw & ME_OVF) != 0 }
+
+// ── Readings ─────────────────────────────────────────────────────────
+
+// The bus voltage in millivolts, or `None` when the part did not answer.
+// It needs no calibration.
+pub fn bus_read<P: Ina226Port>(p: P) -> ?MilliVolts [hw]
+    let Some(raw) = reg_read(p, REG_BUS) else return None
+    Some(MilliVolts { mv: bus_mv_of(raw) })
+
+// The latest measurement with the flags read with it, for a shunt of
+// `shunt_micro_ohm` micro-ohms.  `None` when the part did not answer or
+// the calibration was never set.  With the math overflow flag set the
+// current and power are 0 and `overflow` is set.  MASK/ENABLE is read last,
+// which clears CVRF and a latched AFF; the flags returned are what it held.
+pub fn reading_with_flags<P: Ina226Port>(p: P, shunt_micro_ohm: Int) -> ?Ina226Reading [hw]
+    let Some(cal) = cal_read(p) else return None
+    if cal == 0
+        return None
+    let Some(shunt) = reg_read(p, REG_SHUNT) else return None
+    let Some(bus) = reg_read(p, REG_BUS) else return None
+    let Some(current) = reg_read(p, REG_CURRENT) else return None
+    let Some(power) = reg_read(p, REG_POWER) else return None
+    let Some(mask) = reg_read(p, REG_MASK) else return None
+    let flags = flags_of(mask)
+    var ua = 0
+    var uw = 0
+    if not flags.overflow
+        ua = current_ua_of(current, cal, shunt_micro_ohm)
+        uw = power_uw_of(power, cal, shunt_micro_ohm)
+    let r = MonReading { bus: MilliVolts { mv: bus_mv_of(bus) }, shunt: MicroVolts { uv: shunt_uv_of(shunt) },
+                         current: MicroAmps { ua: ua }, power: MicroWatts { uw: uw }, overflow: flags.overflow }
+    Some(Ina226Reading { reading: r, flags: flags })
+
+// The latest measurement of the CurrentMonitor: `reading_with_flags`
+// without the flags.
+pub fn reading_of<P: Ina226Port>(p: P, shunt_micro_ohm: Int) -> ?MonReading [hw]
+    match reading_with_flags(p, shunt_micro_ohm)
+        Some(x) => Some(x.reading)
+        None => None
+
+// Starts a conversion of the shunt and the bus voltage and answers the time
+// it takes in microseconds, to be waited before the result is read.  A
+// part in a continuous mode converts by itself, so nothing is written and
+// the answer is 0.  Otherwise CONFIG is written in the triggered mode for
+// both signals, with the averaging and conversion times it holds.  -1 when
+// the part did not answer.
+pub fn convert_start<P: Ina226Port>(p: P) -> Int [hw]
+    let Some(c) = config_read(p) else return -1
+    if mode_is_continuous(c.mode)
+        return 0
+    let t = Ina226Config { avg: c.avg, vbus_ct: c.vbus_ct, vshunt_ct: c.vshunt_ct, mode: MODE_BOTH_TRIGGERED }
+    if not config_write(p, t)
+        return -1
+    result_us(t)
+
+// Whether a conversion has finished: the Conversion Ready flag.  Reading it
+// clears it.
+pub fn conversion_ready<P: Ina226Port>(p: P) -> Bool [hw]
+    match reg_read(p, REG_MASK)
+        Some(m) => (m & ME_CVRF) != 0
+        None => false
+
+// ── The alert ────────────────────────────────────────────────────────
+
+// The raw shunt-voltage limit for `uv` microvolts: 2.5 uV per step, rounded
+// toward zero.
+pub fn shunt_limit_raw(uv: Int) -> Int
+    (uv * 2 / 5) & 0xFFFF
+
+// The raw bus-voltage limit for `mv` millivolts: 1.25 mV per step.
+pub fn bus_limit_raw(mv: Int) -> Int
+    (mv * 4 / 5) & 0x7FFF
+
+// The raw power limit for `uw` microwatts under a calibration `cal` and a
+// shunt of `shunt_micro_ohm` micro-ohms: a step is 25 steps of the current.
+// 0 for a calibration or a resistance that is not positive.
+pub fn power_limit_raw(uw: Int, cal: Int, shunt_micro_ohm: Int) -> Int
+    if cal <= 0 or shunt_micro_ohm <= 0
+        return 0
+    (uw * cal * shunt_micro_ohm / (25 * CAL_NUM)) & 0xFFFF
+
+// Sets the alert: the function (`ALERT_NONE` or one of the five), whether the
+// Conversion Ready flag also asserts the pin, the polarity (`active_high`
+// for an active-high open-collector output, the default being active low)
+// and whether the alert latches until MASK/ENABLE is read.  The raw limit
+// is written first, so the function never compares against a stale one.
+// Whether the part holds both writes.  A function outside 0 to 5 is
+// refused.
+pub fn alert_write<P: Ina226Port>(p: P, func: Int, conversion_ready: Bool, active_high: Bool,
+                                  latch: Bool, limit_raw: Int) -> Bool [hw]
+    if func < 0 or func > 5
+        return false
+    if not reg_set(p, REG_LIMIT, limit_raw & 0xFFFF, 0xFFFF)
+        return false
+    var enable = 0
+    if func != 0
+        enable = 1 << (16 - func)
+    if conversion_ready
+        enable = enable | ME_CNVR
+    if active_high
+        enable = enable | ME_APOL
+    if latch
+        enable = enable | ME_LEN
+    reg_set(p, REG_MASK, enable, 0xFC03)
+
+// MASK/ENABLE as flags, or `None` when the part did not answer.  Reading it
+// clears CVRF and a latched AFF.
+pub fn flags_read<P: Ina226Port>(p: P) -> ?Ina226Flags [hw]
+    let Some(m) = reg_read(p, REG_MASK) else return None
+    Some(flags_of(m))
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+// Brings the part up: the bus made ready, the manufacturer and die ID
+// checked, the part reset and CONFIG checked against its power-on value.
+// Answers whether the part answered as an INA226.  The calibration is
+// zero after it: a program calls `mon_set_shunt` next.
+pub fn start<P: Ina226Port>(p: P) -> Bool [hw]
+    if not p.setup()
+        return false
+    if id_read(p) == None
+        return false
+    if not reset(p)
+        return false
+    reg_read(p, REG_CONFIG) == Some(CONFIG_POR)
+
+// ── The part on the board's I2C bus ──────────────────────────────────
+
+// The bus the part is on: the board's I2C bus at `w.addr`, 0x40 to 0x4F,
+// and the board's GPIO for the ALERT line.
+pub @value
+struct Ina226I2c
+    bus: BoardI2c
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Ina226Port for Ina226I2c
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.pins, self.w)
+
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
+        i2c_write(self.bus, self.w, reg, src)
+
+    fn alert_level(self) -> Int [hw]
+        alert_level_of(self.pins, self.w)
+
+// An INA226 on a board's I2C bus, with the shunt resistor of its board.
+pub @value
+struct Ina226
+    port: Ina226I2c
+    shunt_micro_ohm: Int
+
+impl Ina226
+    // The part at `w.addr` on the board's I2C bus, with the board's shunt
+    // resistor of `shunt_micro_ohm` micro-ohms (a 2 mohm shunt is 2000), as
+    // a board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardI2c, pins: BoardGpio, w: DeviceWiring, shunt_micro_ohm: Int) -> Ina226
+        Ina226 { port: Ina226I2c { bus: bus, pins: pins, w: w }, shunt_micro_ohm: shunt_micro_ohm }
+
+    // Brings the part up (`start`).
+    fn begin(self) -> Bool [hw]
+        start(self.port)
+
+    // The shunt resistance of the board, in micro-ohms.
+    fn shunt(self) -> Int
+        self.shunt_micro_ohm
+
+    // The register `r`, 16 bits, `None` when the part did not answer.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self.port, r)
+
+    // The Calibration register: 0 when no shunt was set.
+    fn calibration(self) -> ?Int [hw]
+        cal_read(self.port)
+
+    // The latest measurement with the flags read with it.
+    fn reading(self) -> ?Ina226Reading [hw]
+        reading_with_flags(self.port, self.shunt_micro_ohm)
+
+    // MASK/ENABLE as flags; reading it clears CVRF and a latched AFF.
+    fn flags(self) -> ?Ina226Flags [hw]
+        flags_read(self.port)
+
+    // Whether a conversion has finished.
+    fn ready(self) -> Bool [hw]
+        conversion_ready(self.port)
+
+    // The CONFIG fields.
+    fn config(self) -> ?Ina226Config [hw]
+        config_read(self.port)
+
+    // Writes the CONFIG fields.
+    fn set_config(self, c: Ina226Config) -> Bool [hw]
+        config_write(self.port, c)
+
+    // Sets the averaging code, 0 to 7.
+    fn set_averaging(self, code: Int) -> Bool [hw]
+        averaging_write(self.port, code)
+
+    // Sets the conversion time codes of the bus and shunt voltages.
+    fn set_conversion_times(self, vbus_ct: Int, vshunt_ct: Int) -> Bool [hw]
+        conversion_times_write(self.port, vbus_ct, vshunt_ct)
+
+    // Sets the operating mode, 0 to 7.
+    fn set_mode(self, mode: Int) -> Bool [hw]
+        mode_write(self.port, mode)
+
+    // Sets the alert; see `alert_write`.
+    fn set_alert(self, func: Int, conversion_ready: Bool, active_high: Bool,
+                 latch: Bool, limit_raw: Int) -> Bool [hw]
+        alert_write(self.port, func, conversion_ready, active_high, latch, limit_raw)
+
+    // The level of the ALERT pin, -1 for a wiring with none.
+    fn alert_pin(self) -> Int [hw]
+        self.port.alert_level()
+
+impl CurrentMonitor[hw] for Ina226
+    // One rail.
+    fn mon_channels(self) -> Int [hw]
+        1
+
+    // Programs the calibration for the largest current the program expects.
+    // `shunt_micro_ohm` has to be the resistance the board was attached
+    // with: a different one would make every reading wrong, so it is
+    // refused, as is a shunt that would drop more than 81.92 mV at the
+    // largest current, and a channel the part does not have.
+    fn mon_set_shunt(self, ch: Int, shunt_micro_ohm: Int, max_ua: Int) -> Bool [hw]
+        if ch != 0 or shunt_micro_ohm != self.shunt_micro_ohm
+            return false
+        cal_write(self.port, shunt_micro_ohm, max_ua)
+
+    // The measurement of channel 0, or `None` before a shunt was set.
+    fn mon_read(self, ch: Int) -> ?MonReading [hw]
+        if ch != 0
+            return None
+        reading_of(self.port, self.shunt_micro_ohm)
+
+    // The bus voltage of channel 0, which needs no calibration.
+    fn mon_bus_voltage(self, ch: Int) -> ?MilliVolts [hw]
+        if ch != 0
+            return None
+        bus_read(self.port)
+
+    // Starts a triggered conversion and answers its time in microseconds,
+    // 0 in a continuous mode, -1 when the part did not answer.
+    fn mon_start(self) -> Int [hw]
+        convert_start(self.port)
+
+impl Identifiable[hw] for Ina226
+    // The die ID's device field, 0x226, with the revision as `rev`, after
+    // the manufacturer ID matched 0x5449.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self.port)

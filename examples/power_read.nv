@@ -1,0 +1,76 @@
+/* power_read.nv: a reading loop for an INA226 on a breakout, for an nRF52840
+ * DK or an nRF54LM20 DK
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *          or make this file the main of a package that depends on
+ *          ina226-nv and run
+ *              novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The breakout's SDA and SCL go to the board's I2C pins, its A0 and A1
+ * pins to ground, which puts the part at 0x40, and the load goes through
+ * its shunt, a 0.1 ohm resistor.  The program brings the part up, which
+ * checks its manufacturer and die ID and resets it, tells it the shunt and
+ * the largest current it expects, 800 mA (80 mV across the shunt, under
+ * the 81.92 mV the part measures), and once a second prints one line over
+ * RTT:
+ *
+ *     ina226 mV=<bus millivolts> uA=<microamps> uW=<microwatts>
+ *
+ * A current that flows from the supply side to the load side is positive.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the UART and the
+ * timer.
+ *
+ * Boards: the nRF52840 DK and the nRF54LM20 DK build this program, but
+ * neither board has a driver for its two-wire interface yet (TWIM), so
+ * `BoardI2c` is absent hardware there and the program prints
+ * "ina226: no answer" until a board package names one with `@hal(i2c)`.
+ * The part has not been read on a board.
+ */
+use embedded_hal.{ BoardI2c, BoardGpio }
+use dev_bus
+use dev_current.{ CurrentMonitor }
+use ina226.{ Ina226 }
+
+// The part's address with A1 and A0 at ground.
+const ADDR = 0x40
+
+// The breakout's shunt resistor in micro-ohms, and the largest current
+// the program expects in microamps.
+const SHUNT_UOHM = 100000
+const MAX_UA = 800000
+
+// A label and a number, written without building a string.
+@tier(embedded)
+fn field(label: Str, v: Int) [hw]
+    hal.uart.write(label)
+    hal.uart.write(str.from_int(v))
+
+@tier(embedded)
+fn main() [hw]
+    let part = Ina226.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, dev_bus.wiring_i2c(0, ADDR), SHUNT_UOHM)
+    if not part.begin()
+        hal.uart.write("ina226: no answer\n")
+        return
+    if not part.mon_set_shunt(0, SHUNT_UOHM, MAX_UA)
+        hal.uart.write("ina226: shunt refused\n")
+        return
+    loop
+        // The part converts continuously, so the wait is 0; a part set to
+        // a triggered mode answers the time of the conversion.
+        let us = part.mon_start()
+        if us >= 0
+            hal.timer.delay_us(us)
+        match part.mon_read(0)
+            Some(r) =>
+                hal.uart.write("ina226")
+                field(" mV=", r.bus.mv)
+                field(" uA=", r.current.ua)
+                field(" uW=", r.power.uw)
+                hal.uart.write("\n")
+            None =>
+                hal.uart.write("ina226: no result\n")
+        hal.timer.delay_ms(1000)
