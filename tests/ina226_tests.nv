@@ -20,7 +20,7 @@
 
 use std.test
 use embedded_hal.{ BoardI2c, BoardGpio, I2cBus, GpioOut }
-use dev_bus.{ DeviceWiring, DevBytes }
+use dev_bus.{ DeviceWiring, DevBytes, RegPort }
 use dev_power.{ MilliVolts }
 use dev_current.{ MicroVolts, MicroAmps, MicroWatts, MonReading, CurrentMonitor }
 use dev_id.{ DeviceId, Identifiable }
@@ -198,18 +198,24 @@ struct Dut
     pins: FakePins
     w: DeviceWiring
 
-impl Ina226Port for Dut
-    fn setup(self) -> Bool [hw]
-        ina226.i2c_setup(self.bus, self.pins, self.w)
-
+impl RegPort for Dut
     fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
         ina226.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        var src: DevBytes = Vec.new()
+        let _ = src.push((v & 0xFF) as u8)
+        ina226.i2c_write(self.bus, self.w, reg, src)
 
     fn write_regs(self, reg: Int, src: DevBytes) -> Bool [hw]
         ina226.i2c_write(self.bus, self.w, reg, src)
 
+impl Ina226Port for Dut
+    fn setup(self) -> Bool [hw]
+        dev_bus.wiring_i2c_setup(self.bus, self.pins, self.w, 400000)
+
     fn alert_level(self) -> Int [hw]
-        ina226.alert_level_of(self.pins, self.w)
+        dev_bus.wiring_irq_level(self.pins, self.w)
 
 // The board's wiring: the part at 0x40, ALERT on pin 9.
 fn wiring() -> DeviceWiring
@@ -469,14 +475,14 @@ fn test_the_alert_limits_are_in_the_registers_steps() [io, hw]
 fn test_a_read_is_the_pointer_then_a_repeated_start_and_two_bytes() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert_eq(int_or(ina226.reg_read(d, 0xFE)), 0x5449)
+    test.assert_eq(int_or(d.read_reg16_be(0xFE)), 0x5449)
     log_is(c, [2, 0x40, 0xFE, 2, -1])
 
 @test
 fn test_a_write_is_the_pointer_then_the_high_byte_then_the_low() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert(ina226.reg_write(d, 0x07, 0x1234))
+    test.assert(d.write_reg16_be(0x07, 0x1234))
     log_is(c, [1, 0x40, 0x07, 0x12, 0x34, -1])
     test.assert_eq(at(c.regs, 0x07), 0x1234)
 
@@ -484,22 +490,22 @@ fn test_a_write_is_the_pointer_then_the_high_byte_then_the_low() [io, hw]
 fn test_a_set_register_is_read_back_under_a_mask() [io, hw]
     let c = chip()
     let d = dut(c)
-    test.assert(ina226.reg_set(d, 0x07, 0xBEEF, 0xFFFF))
+    test.assert(d.write_reg16_be_verified(0x07, 0xBEEF, 0xFFFF))
     log_is(c, [1, 0x40, 0x07, 0xBE, 0xEF, -1, 2, 0x40, 0x07, 2, -1])
     // A register that ignores the write differs from what was written.
     c.ro.insert(0x07, 1)
-    test.assert(not ina226.reg_set(d, 0x07, 0x1111, 0xFFFF))
+    test.assert(not d.write_reg16_be_verified(0x07, 0x1111, 0xFFFF))
     // Bits outside the mask are not compared: the register holds 0xBE00.
     c.regs.insert(0x07, 0xBE00)
-    test.assert(ina226.reg_set(d, 0x07, 0xBEEF, 0xFF00))
-    test.assert(not ina226.reg_set(d, 0x07, 0xBEEF, 0xFFFF))
+    test.assert(d.write_reg16_be_verified(0x07, 0xBEEF, 0xFF00))
+    test.assert(not d.write_reg16_be_verified(0x07, 0xBEEF, 0xFFFF))
     c.ro.insert(0x07, 0)
     // A write the part refuses, and a read-back it does not answer.
     c.st.insert(42, 0)
-    test.assert(not ina226.reg_set(d, 0x07, 0x2222, 0xFFFF))
+    test.assert(not d.write_reg16_be_verified(0x07, 0x2222, 0xFFFF))
     c.st.insert(42, 1)
     c.st.insert(41, 0)
-    test.assert(not ina226.reg_set(d, 0x07, 0x2222, 0xFFFF))
+    test.assert(not d.write_reg16_be_verified(0x07, 0x2222, 0xFFFF))
 
 @test
 fn test_a_read_longer_than_one_register_is_not_something_the_part_defines() [io, hw]
@@ -514,8 +520,8 @@ fn test_a_part_that_is_not_there_does_not_answer() [io, hw]
     let c = chip()
     c.st.insert(4, 0)
     let d = dut(c)
-    test.assert(ina226.reg_read(d, 0x00) == None)
-    test.assert(not ina226.reg_write(d, 0x00, 1))
+    test.assert(d.read_reg16_be(0x00) == None)
+    test.assert(not d.write_reg16_be(0x00, 1))
     test.assert(ina226.manufacturer_read(d) == None)
     test.assert(ina226.die_read(d) == None)
     test.assert(ina226.id_read(d) == None)
@@ -534,9 +540,9 @@ fn test_the_part_answers_only_at_its_own_address() [io, hw]
     let c = chip()
     c.st.insert(5, 0x41)
     let d = dut(c)
-    test.assert(ina226.reg_read(d, 0x00) == None)
+    test.assert(d.read_reg16_be(0x00) == None)
     let e = Dut { bus: FakeI2c { c: c }, pins: pins(), w: dev_bus.wiring_i2c(0, 0x41) }
-    test.assert_eq(int_or(ina226.reg_read(e, 0x00)), 0x4127)
+    test.assert_eq(int_or(e.read_reg16_be(0x00)), 0x4127)
 
 @test
 fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
@@ -568,7 +574,7 @@ fn test_the_alert_pin_level() [io, hw]
     test.assert_eq(d.alert_level(), 1)
     d.pins.levels.insert(9, 0)
     test.assert_eq(d.alert_level(), 0)
-    test.assert_eq(ina226.alert_level_of(d.pins, dev_bus.wiring_i2c(0, 0x40)), -1)
+    test.assert_eq(dev_bus.wiring_irq_level(d.pins, dev_bus.wiring_i2c(0, 0x40)), -1)
 
 // ── Identity and bring-up ────────────────────────────────────────────
 
@@ -773,8 +779,8 @@ fn test_the_data_sheets_example_reads_10_amps_and_119_8_watts() [io, hw]
     example(c, d)
     // The double computes the Current and Power registers by Equations 3
     // and 4: 10000 and 4792.
-    test.assert_eq(int_or(ina226.reg_read(d, 0x04)), 10000)
-    test.assert_eq(int_or(ina226.reg_read(d, 0x03)), 4792)
+    test.assert_eq(int_or(d.read_reg16_be(0x04)), 10000)
+    test.assert_eq(int_or(d.read_reg16_be(0x03)), 4792)
     log_clear(c)
     let r = reading_or(ina226.reading_with_flags(d, 2000))
     test.assert_eq(r.reading.bus.mv, 11980)
@@ -1010,6 +1016,8 @@ fn test_the_type_over_absent_hardware() [io, hw]
     test.assert_eq(p.shunt(), 100000)
     test.assert(not p.begin())
     test.assert(p.reg(0x00) == None)
+    test.assert(not p.port.write_reg(0x00, 1))
+    test.assert(not p.port.write_regs(0x00, Vec.new()))
     test.assert(p.calibration() == None)
     test.assert(p.reading() == None)
     test.assert(p.flags() == None)
@@ -1042,3 +1050,21 @@ fn test_the_current_monitor_over_absent_hardware() [io, hw]
     // A read after the wait gives the same answer as a read.
     test.assert(p.mon_read_after(0, 10, 100) == None)
     test.assert(p.mon_read_after(0, 100, 100) == None)
+
+// ── The functions that the register methods replace ──────────────────
+
+@test
+fn test_the_deprecated_register_functions_answer_as_the_methods_do() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert_eq(int_or(ina226.reg_read(d, 0xFE)), 0x5449)
+    test.assert(ina226.reg_write(d, 0x07, 0x1234))
+    test.assert(ina226.reg_set(d, 0x07, 0xBEEF, 0xFFFF))
+    test.assert_eq(int_or(d.read_reg16_be(0x07)), 0xBEEF)
+
+@test
+fn test_the_deprecated_bus_functions_answer_as_the_shared_ones_do() [io, hw]
+    let c = chip()
+    let d = dut(c)
+    test.assert(ina226.i2c_setup(d.bus, d.pins, d.w))
+    test.assert_eq(ina226.alert_level_of(d.pins, d.w), dev_bus.wiring_irq_level(d.pins, d.w))

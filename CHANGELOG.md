@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.0 — 2026-11-24
+
+The register reads and writes, and the bus set-up, are devices-nv's `RegPort` and `wiring_*` functions, and `Ina226Port` is smaller by them.  The release depends on devices-nv 0.4.1.
+
+### Breaking
+
+- **`Ina226Port` has the supertrait `RegPort` and no longer declares `read_regs` and `write_reg`.**  A type that implements `Ina226Port` for a bus of its own moves those two methods, unchanged, into an `impl RegPort`.  *Migration:* with `use dev_bus.{ RegPort }`,
+
+  ```novo
+  impl RegPort for MyPort
+      fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+          ...
+      fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+          ...
+
+  impl Ina226Port for MyPort
+      ...                      // the other methods stay where they are
+  ```
+
+  The package's own types are migrated.  A caller that holds one of them is unaffected.
+
+### Deprecated
+
+- `reg_read`, `reg_write`, `reg_set`, `i2c_setup`, `alert_level_of`: each is a one-line function over the method or the `wiring_*` function that replaces it, warns W1001 at a call with the replacement named, and is removed in the next release.  `Ina226Port` itself is the driver's trait and stays.
+
+### Changed
+
+- The register helpers the module carried (`reg_read`, `reg_write`, `reg_update` over its port) are devices-nv's `RegPort` methods (`read_reg`, `write_reg_verified`, `update_reg_verified` and the others); the module calls them as `p.read_reg(reg)`.
+- The part's registers are 16 bits wide, so the driver reads them with `read_reg16_be` and writes them with `write_reg16_be` and `write_reg16_be_verified` (the masked read-back of `reg_set`); its `write_reg` of one byte is the bus's single-byte write and the driver does not call it.
+- Image size on nrf52840-dk, `.text` plus read-only data, before and after: 17,380 bytes before and 17,284 after on the power reader (nrf52-qemu: 9,052 and 9,020).
+
 ## 0.1.1 — 2026-11-23
 
 The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.2) and devices-nv ^0.4.0 (was ^0.3.3), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".

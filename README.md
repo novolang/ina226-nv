@@ -191,7 +191,7 @@ set, and it latches until MASK/ENABLE is read if the latch bit is set.
 
 | Module | What is in it |
 |---|---|
-| `ina226` | The types `Ina226`, `Ina226Config`, `Ina226Cal`, `Ina226Flags` and `Ina226Reading`, the trait `Ina226Port`, the bus framing, the registers, the identity, the configuration, the calibration, the readings, the alert and the bring-up |
+| `ina226` | The types `Ina226`, `Ina226Config`, `Ina226Cal`, `Ina226Flags` and `Ina226Reading`, the trait `Ina226Port` over devices-nv's `RegPort`, the bus framing, the identity, the configuration, the calibration, the readings, the alert and the bring-up |
 
 ## How to choose an entry point
 
@@ -224,9 +224,12 @@ The alert functions are named: `ALERT_NONE`, `ALERT_SHUNT_OVER`,
 and microwatts into the register's steps.
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Ina226Port` over its bus and calls the module's functions,
-which take the port: `ina226.reading_with_flags(port, shunt)`,
-`ina226.cal_write(port, shunt, max_ua)`.  The framing is `i2c_read_into`
+implements devices-nv's `RegPort` (`read_regs`, `write_reg` and the block write
+`write_regs`) and `Ina226Port` (`setup` and `alert_level`) over its bus, and
+calls the module's functions, which take the port:
+`ina226.reading_with_flags(port, shunt)`, `ina226.cal_write(port, shunt, max_ua)`.
+The 16-bit registers are read and written with the methods of `RegPort`,
+`port.read_reg16_be(reg)` and `port.write_reg16_be(reg, v)`.  The framing is `i2c_read_into`
 and `i2c_write`, generic over `I2cBus`.  The conversions are
 `shunt_uv_of`, `bus_mv_of`, `current_ua_of` and `power_uw_of`, which need
 no bus.
